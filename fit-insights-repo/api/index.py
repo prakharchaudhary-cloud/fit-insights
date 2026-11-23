@@ -1336,7 +1336,11 @@ class Web(BaseHTTPRequestHandler):
         cookie = self.headers.get("Cookie") or ""
         token = next((c.split("=", 1)[1] for c in cookie.replace(" ", "").split(";") if c.startswith("fi_session=")), "")
         if _state["hosted"]:
-            if not host or (origin is not None and origin != self.base_url()):
+            # the page's own address, as the browser states it, must match the address we were reached on
+            schemes = ("https://", "http://") if self.base_url().startswith("http://") else ("https://",)
+            ours = {sch + h for h in (host, self.headers.get("X-Forwarded-Host")) if h for sch in schemes}
+            same_origin = self.headers.get("Sec-Fetch-Site") == "same-origin"  # the browser itself vouching for it
+            if not host or (origin is not None and origin not in ours and not same_origin):
                 return None
             if not phone_enabled():
                 return "setup"
@@ -2188,6 +2192,45 @@ class _Headers(dict):
         return dict.get(self, key.lower(), default)
 
 
+_FUNCTION_PATHS = ("/api/index", "/api/index.py", "/api")
+
+
+def original_url(environ):
+    """Vercel sends every address to this one function and reports the function's own path (/api/index),
+    not the page that was asked for. vercel.json passes the real path along as ?__path=..., so read it back.
+    Returns (path, query string, whether the real path was found)."""
+    path, qs = environ.get("PATH_INFO") or "/", environ.get("QUERY_STRING") or ""
+    pairs = urllib.parse.parse_qsl(qs, keep_blank_values=True)
+    passed = SERVERLESS and any(k == "__path" and ":" not in v for k, v in pairs)
+    if path.rstrip("/") not in _FUNCTION_PATHS and not passed:
+        return path, qs, True
+    rest = urllib.parse.urlencode([(k, v) for k, v in pairs if k not in ("__path", "path")])
+    for key in ("__path", "path"):
+        hit = [v for k, v in pairs if k == key]
+        if hit and ":" not in hit[0]:
+            return "/" + "/".join(hit).lstrip("/"), rest, True
+    for key in ("REQUEST_URI", "RAW_URI", "HTTP_X_ORIGINAL_URL", "HTTP_X_ORIGINAL_URI", "HTTP_X_REWRITE_URL",
+                "HTTP_X_FORWARDED_URI", "HTTP_X_VERCEL_ORIGINAL_URL", "HTTP_X_VERCEL_ORIGINAL_PATH", "HTTP_X_INVOKE_PATH"):
+        u = urllib.parse.urlparse(environ.get(key) or "")
+        if u.path.startswith("/") and u.path.rstrip("/") not in _FUNCTION_PATHS:
+            return u.path, u.query, True
+    return path, qs, False
+
+
+def routing_report(environ):
+    """Shown only if the real path can't be found: what the host passed in (header names only, no values)."""
+    keep = ("PATH_INFO", "QUERY_STRING", "SCRIPT_NAME", "REQUEST_URI", "RAW_URI", "REQUEST_METHOD")
+    lines = [f"{k} = {environ.get(k)!r}" for k in keep]
+    lines += [f"{k} = {v!r}" for k, v in sorted(environ.items())
+              if k.startswith("HTTP_") and any(w in k for w in ("PATH", "URL", "URI", "MATCHED", "INVOKE"))]
+    lines.append("headers: " + ", ".join(sorted(k[5:].lower() for k in environ if k.startswith("HTTP_"))))
+    body = "\n".join(lines).replace("&", "&amp;").replace("<", "&lt;")
+    return ("<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>Fit Insights</title><body style='font:15px/1.5 system-ui;max-width:760px;margin:6vh auto;padding:0 16px'>"
+            "<h2>Routing check</h2><p>The app is running but can't tell which page was asked for. "
+            "Send a screenshot of this page.</p><pre style='white-space:pre-wrap;word-break:break-all'>" + body + "</pre></body>")
+
+
 class _WSGIHandler(Web):
     """The same request handling as above, fed by a web host instead of Python's built-in server."""
 
@@ -2202,8 +2245,8 @@ class _WSGIHandler(Web):
         self.headers = h
         self.client_address = (environ.get("REMOTE_ADDR") or "", 0)
         self.rfile = environ["wsgi.input"]
-        qs = environ.get("QUERY_STRING") or ""
-        self.path = (environ.get("PATH_INFO") or "/") + ("?" + qs if qs else "")
+        path, qs, self.routed = original_url(environ)
+        self.path = path + ("?" + qs if qs else "")
         self.command = environ.get("REQUEST_METHOD", "GET")
         self.result = (500, [("Content-Type", "text/plain")], b"Server error")
 
@@ -2217,11 +2260,10 @@ NO_STORAGE_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>body{font:16px/1.5 -apple-system,system-ui,sans-serif;background:#f4f4f2;color:#0b0b0b;max-width:560px;margin:8vh auto;padding:0 20px}
 @media (prefers-color-scheme:dark){body{background:#111110;color:#f0efec}}li{margin:6px 0}code{background:#8882;padding:1px 5px;border-radius:5px}</style></head>
 <body><h2>Almost there: @@TITLE@@</h2><p>@@WHY@@</p><ol>
-<li>Open <b>vercel.com</b> and click this project.</li>
-<li>Click the <b>Storage</b> tab, then <b>Create Database</b>, and choose <b>Neon</b> (Serverless Postgres).</li>
-<li>Keep the suggested region and the <b>Free</b> plan, and click through <b>Continue</b> and <b>Create</b>.</li>
-<li>When it asks, <b>connect</b> it to this project.</li>
-<li>Click the <b>Deployments</b> tab, open the <b>&hellip;</b> menu on the top row, and click <b>Redeploy</b>.</li>
+<li>Open <b>vercel.com/marketplace/neon</b> and click <b>Install</b>.</li>
+<li>Choose <b>Create New Neon Account</b>, keep the suggested region and the <b>Free</b> plan, and click through <b>Continue</b> and <b>Create</b>.</li>
+<li>On <b>Connect a Project</b>, pick this project and click <b>Connect</b>.</li>
+<li>In the project, click <b>Deployments</b>, open the <b>&hellip;</b> menu on the top row, and click <b>Redeploy</b>.</li>
 <li>Reload this page.</li></ol></body></html>"""
 
 
@@ -2253,7 +2295,9 @@ def application(environ, start_response):
         return [page]
     h = _WSGIHandler(environ)
     try:
-        if h.command in ("GET", "HEAD"):
+        if not h.routed and SERVERLESS:
+            h.send(200, routing_report(environ))
+        elif h.command in ("GET", "HEAD"):
             h.do_GET()
         elif h.command == "POST":
             h.do_POST()
